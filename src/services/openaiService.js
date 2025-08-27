@@ -147,34 +147,101 @@ export async function findBestMatch(userQuestion) {
 }
 
 // Generic LLM API call using axios like lernbegleiter
-export async function callLLM(messages, provider, apiKey) {
+export async function callLLM(messages, provider, apiKey, wloSuggestions = []) {
 
   try {
     const axios = (await import('axios')).default;
     
-    // Add system prompt to prohibit LaTeX
-    const systemPrompt = {
-      role: "system",
-      content: "Du bist ein hilfreicher Tutor-Assistent. Verwende Markdown für die Formatierung deiner Antworten. Verwende NIEMALS LaTeX-Syntax oder mathematische Formeln in LaTeX-Format. Nutze stattdessen einfache Textformatierung oder Unicode-Zeichen für mathematische Ausdrücke."
-    };
+    // Optional WLO context as system message (list materials concisely + structured JSON)
+    let wloSystemMessage = null;
+    try {
+      if (Array.isArray(wloSuggestions) && wloSuggestions.length > 0) {
+        const maxItems = Math.min(10, wloSuggestions.length);
+        const lines = [];
+        lines.push(`VERFÜGBARE WLO-LERNMATERIALIEN (${maxItems} von ${wloSuggestions.length}):`);
+        for (let i = 0; i < maxItems; i++) {
+          const s = wloSuggestions[i] || {};
+          const title = (s.title || '').toString().slice(0, 140);
+          const url = (s.url || s.wwwUrl || '').toString();
+          const subject = s.subject || 'Allgemein';
+          const type = s.resourceType || 'Lernressource';
+          const desc = (s.description || '').toString().replace(/\s+/g, ' ').slice(0, 220);
+          lines.push(`- Titel: ${title}\n  URL: ${url}\n  Fach: ${subject} • Typ: ${type}${desc ? `\n  Hinweis: ${desc}` : ''}`);
+        }
+        // Add a compact JSON representation to improve parsing stability
+        const jsonMaterials = [];
+        for (let i = 0; i < maxItems; i++) {
+          const s = wloSuggestions[i] || {};
+          jsonMaterials.push({
+            refId: s.refId || null,
+            title: s.title || null,
+            url: s.url || s.wwwUrl || null,
+            subject: s.subject || null,
+            resourceType: s.resourceType || null,
+            description: typeof s.description === 'string' ? s.description : null
+          });
+        }
+        lines.push('\n---');
+        lines.push('WLO_MATERIALS_JSON:');
+        lines.push('```json');
+        lines.push(JSON.stringify(jsonMaterials));
+        lines.push('```');
+        wloSystemMessage = { role: 'system', content: lines.join('\n') };
+      }
+    } catch {}
+
+    let messagesWithSystem = messages;
+    if (wloSystemMessage) {
+      if (messages.length > 0 && messages[0].role === 'system') {
+        messagesWithSystem = [messages[0], wloSystemMessage, ...messages.slice(1)];
+      } else {
+        messagesWithSystem = [wloSystemMessage, ...messages];
+      }
+    }
     
-    const messagesWithSystem = [systemPrompt, ...messages];
-    
-    const response = await axios.post(`${provider.baseUrl}/chat/completions`, {
+    const url = `${provider.baseUrl}/chat/completions`;
+    const payload = {
       model: provider.model,
       messages: messagesWithSystem,
       temperature: 0.7,
       max_tokens: 1000
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {})
-      }
-    });
+    };
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {})
+    };
 
-    console.log('API Response:', response.data);
-    return response.data.choices[0].message.content;
+    const postOnce = () => axios.post(url, payload, { headers });
+
+    try {
+      const response = await postOnce();
+      console.log('API Response:', response.data);
+      return response.data.choices[0].message.content;
+    } catch (err) {
+      const status = err?.response?.status;
+      const data = err?.response?.data;
+      const is5xx = typeof status === 'number' && status >= 500 && status < 600;
+      // One retry on transient 5xx (e.g., upstream hiccup)
+      if (is5xx) {
+        console.warn('[callLLM] 5xx from provider, retrying once...', {
+          provider: provider?.id,
+          status,
+          url
+        });
+        // brief delay
+        await new Promise(r => setTimeout(r, 400));
+        const retry = await postOnce();
+        console.log('API Response (retry):', retry.data);
+        return retry.data.choices[0].message.content;
+      }
+      // Non-retryable error: enrich message
+      let detail = '';
+      try {
+        detail = typeof data === 'string' ? data.slice(0, 500) : JSON.stringify(data)?.slice(0, 500);
+      } catch {}
+      throw new Error(`Fehler bei der API-Anfrage: status=${status ?? 'n/a'} provider=${provider?.id} detail=${detail || err.message}`);
+    }
   } catch (error) {
     console.error('API Error:', error);
     throw new Error('Fehler bei der API-Anfrage: ' + (error.response?.data?.error?.message || error.message));
@@ -235,7 +302,7 @@ function enforceLabelPrefix(text, wantQALabel) {
 }
 
 // Main chat function with provider support
-export async function processMessage(message, conversationHistory = []) {
+export async function processMessage(message, conversationHistory = [], wloSuggestions = []) {
   const provider = getCurrentProvider();
   const apiKey = getApiKeyForProvider(provider);
 
@@ -248,30 +315,48 @@ export async function processMessage(message, conversationHistory = []) {
   let sourceUrl = null;
 
   if (qaMatch) {
-    // Use QA-based response
+    // QA-first: show RAW QA answer unchanged in a QA-labeled section, then optionally append KI supplement.
     isQABased = true;
     sourceUrl = qaMatch.url;
-    
-    const qaPrompt = `Basierend auf dieser QA-Information, beantworte die Frage "${message}":
 
-Frage: ${qaMatch.question}
-Antwort: ${qaMatch.answer}
-URL: ${qaMatch.url}
+    // 1) Raw QA section (unchanged content)
+    const qaLabel = '**[GEPRÜFTE ANTWORT AUF QA-BASIS]**';
+    const qaSection = `${qaLabel}\n\n${qaMatch.answer || ''}`.trim();
 
-Formatiere die Antwort in Markdown. Beginne die Antwort mit "**[GEPRÜFTE ANTWORT AUF QA-BASIS]**" und integriere die URL-Referenz natürlich in deine Antwort.
-
-Wenn die bereitgestellte QA-Information die Nutzerfrage nicht vollständig oder nicht präzise beantwortet (z. B. fehlt eine konkrete Zahl, Definition, Bedingung, Einschränkung), dann füge NACH einem Absatz eine zweite, separat formatierte Ergänzung hinzu, beginnend mit:
-
-"**[UNSICHERE ANTWORT AUF KI-BASIS]**"
-
-Darin darfst du dein eigenes Weltwissen nutzen, um die Frage bestmöglich zu beantworten. Mache kenntlich, wenn Aussagen unsicher sind, vermeide Halluzinationen und nenne ggf. allgemeine Einordnungen oder Vorsichtshinweise. Vermeide Wiederholungen, konzentriere dich auf die fehlenden Informationen.`;
-
-    response = await callLLM([
+    // 2) Optional KI supplement: only if QA likely incomplete. The model must return either
+    //    an empty string or a paragraph starting with the AI-supplement label.
+    const aiSuppLabel = '**[UNSICHERE ERGÄNZUNG AUF KI-BASIS]**';
+    const suppMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: qaPrompt }
-    ], provider, apiKey);
-    response = enforceLabelPrefix(response, true);
-    
+      ...conversationHistory.slice(-6),
+      {
+        role: 'user',
+        content: `Prüfe, ob diese QA-Antwort die Nutzerfrage vollständig beantwortet. Wenn ja, antworte mit einer LEEREN ZEICHENKETTE. Wenn nein, gib NUR eine kurze, vorsichtige Ergänzung zurück, beginnend mit "${aiSuppLabel}". Nutze die WLO-Liste, wenn sinnvoll, und verlinke 1–2 Materialien. Formatiere in Markdown.
+
+Nutzerfrage: ${message}
+QA-Antwort (unverändert):\n${qaMatch.answer || ''}`
+      }
+    ];
+
+    let supplement = '';
+    try {
+      supplement = await callLLM(suppMessages, provider, apiKey, wloSuggestions);
+      if (supplement) {
+        const trimmed = supplement.trim();
+        // Ensure correct label at start if model omitted it
+        if (trimmed && !/^\*\*\[UNSICHERE\s+(ERGÄNZUNG|ANTWORT)\s+AUF\s+KI-BASIS\]\*\*/i.test(trimmed)) {
+          supplement = `${aiSuppLabel}\n\n${trimmed}`;
+        } else {
+          supplement = trimmed;
+        }
+      }
+    } catch (e) {
+      console.warn('KI-Ergänzung fehlgeschlagen:', e);
+      supplement = '';
+    }
+
+    response = supplement ? `${qaSection}\n\n${supplement}` : qaSection;
+
   } else {
     // Use AI-based response
     const messages = [
@@ -280,7 +365,7 @@ Darin darfst du dein eigenes Weltwissen nutzen, um die Frage bestmöglich zu bea
       { role: 'user', content: `Bitte beginne deine Antwort mit "**[UNSICHERE ANTWORT AUF KI-BASIS]**" und formatiere in Markdown.\n\n${message}` }
     ];
 
-    response = await callLLM(messages, provider, apiKey);
+    response = await callLLM(messages, provider, apiKey, wloSuggestions);
     response = enforceLabelPrefix(response, false);
   }
 

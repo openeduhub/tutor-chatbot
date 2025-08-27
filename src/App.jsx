@@ -20,8 +20,10 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [currentProvider, setCurrentProviderState] = useState(null);
   const [qaSettings, setQASettingsState] = useState({ enabled: true, similarityThreshold: 0.5 });
-  const [wloSettings, setWLOSettings] = useState({ enabled: true, debugMode: false, sourceFilter: '', environment: 'production' });
+  const [wloSettings, setWLOSettings] = useState({ enabled: true, debugMode: false, sourceFilter: '', environment: 'production', sidebarMode: 'used' });
   const [currentWLOSuggestions, setCurrentWLOSuggestions] = useState([]);
+  const [usedWLOSuggestions, setUsedWLOSuggestions] = useState([]);
+  const [promptWLOSuggestions, setPromptWLOSuggestions] = useState([]);
   const [learningProgress, setLearningProgress] = useState(learningAnalytics.getLearningProgress());
   const [showImpressum, setShowImpressum] = useState(false);
   const [bloomTracker] = useState(() => new BloomTaxonomyTracker());
@@ -112,6 +114,12 @@ function App() {
     setInputValue('');
     setIsLoading(true);
     setError(null);
+    // Für 'Nur verwendete' Sidebar: vor neuer Antwort zurücksetzen
+    if (wloSettings.sidebarMode === 'used') {
+      setUsedWLOSuggestions([]);
+    }
+    // Prompt-verwendete Materialien immer vor neuem Turn zurücksetzen
+    setPromptWLOSuggestions([]);
 
     try {
       const conversationHistory = messages.map(msg => ({
@@ -152,18 +160,32 @@ function App() {
 
       let response;
       let usedWLO = false;
+      let wloForPrompt = [];
       if (qaMatchPre) {
-        // Sofort QA-basierte Antwort erzeugen (blockiert nicht auf WLO)
-        response = await processMessage(userMessage.content, conversationHistory);
-        // WLO läuft im Hintergrund weiter und aktualisiert nur die Sidebar
+        // QA-basierte Antwort erzeugen
+        // Warte kurz auf WLO-Vorschläge dieser Anfrage (falls verfügbar), damit der Systemprompt sie immer erhält
+        let wloForThisTurn = currentWLOSuggestions;
+        try {
+          if (wloPromise) {
+            const wloRes = await wloPromise;
+            if (wloRes && Array.isArray(wloRes.wloSuggestions)) {
+              wloForThisTurn = wloRes.wloSuggestions;
+            }
+          }
+        } catch {}
+        wloForPrompt = Array.isArray(wloForThisTurn) ? wloForThisTurn : [];
+        response = await processMessage(userMessage.content, conversationHistory, wloForThisTurn);
       } else {
         // Kein QA-Match: Wenn WLO aktiv, warte auf WLO-Antwort; sonst Standard-KI
         const wloResponseMain = wloPromise ? await wloPromise : null;
         if (wloResponseMain) {
           response = wloResponseMain;
           usedWLO = true;
+          wloForPrompt = Array.isArray(wloResponseMain.wloSuggestions) ? wloResponseMain.wloSuggestions : [];
         } else {
-          response = await processMessage(userMessage.content, conversationHistory);
+          // Kein WLO-Ergebnis verfügbar -> normale KI-Antwort, aber mit bisherigen WLO-Vorschlägen
+          wloForPrompt = Array.isArray(currentWLOSuggestions) ? currentWLOSuggestions : [];
+          response = await processMessage(userMessage.content, conversationHistory, currentWLOSuggestions);
         }
       }
 
@@ -181,6 +203,57 @@ function App() {
       };
 
       setMessages(prev => [...prev, assistantMessage]);
+
+      // Merke die Materialien, die im PROMPT verwendet wurden (je Turn)
+      setPromptWLOSuggestions(wloForPrompt);
+
+      // Aktualisiere Liste der im Chat tatsächlich verwendeten WLO-Materialien
+      try {
+        const env = wloSettings.environment;
+        const baseUrl = env === 'staging' 
+          ? 'https://repository.staging.openeduhub.net/edu-sharing' 
+          : 'https://redaktion.openeduhub.net/edu-sharing';
+        const resolveUrl = (s) => {
+          const direct = s?.wwwUrl || s?.url;
+          if (direct) return direct;
+          return s?.refId ? `${baseUrl}/components/render/${s.refId}` : '';
+        };
+        // Für die Erkennung der im Chat VERWENDETEN Materialien prüfen wir immer nur gegen
+        // die tatsächlich im Prompt übergebenen Materialien dieses Turns (wloForPrompt),
+        // oder – falls die Antwort direkt aus WLO kommt – gegen die gelieferten Vorschläge
+        // der Antwort (response.wloSuggestions).
+        const candidateSuggestions = usedWLO ? (response.wloSuggestions || []) : wloForPrompt;
+        const referenced = [];
+        for (const s of candidateSuggestions) {
+          const url = resolveUrl(s);
+          const refId = s?.refId || '';
+          const stripProtocol = (u) => u.replace(/^https?:\/\//, '');
+          const trimSlash = (u) => u.endsWith('/') ? u.slice(0, -1) : u;
+          const content = assistantMessage.content || '';
+          let matched = false;
+          if (url) {
+            const urlNoProto = stripProtocol(url);
+            const urlNoSlash = trimSlash(url);
+            const urlNoProtoNoSlash = trimSlash(urlNoProto);
+            if (
+              content.includes(url) ||
+              content.includes(urlNoProto) ||
+              content.includes(urlNoSlash) ||
+              content.includes(urlNoProtoNoSlash)
+            ) {
+              matched = true;
+            }
+          }
+          if (!matched && refId) {
+            if (content.includes(refId)) matched = true;
+          }
+          if (matched) referenced.push({ ...s, url });
+        }
+        // Zeige in der rechten Leiste (Modus 'used') nur die im AKTUELLEN Assistant-Turn referenzierten Materialien
+        setUsedWLOSuggestions(referenced);
+      } catch (e2) {
+        console.warn('Used WLO extraction failed:', e2);
+      }
 
       // Start Learning Analytics after response - with detailed error tracking
       setTimeout(async () => {
@@ -288,6 +361,35 @@ function App() {
     // Update current topic in learning analytics
     learningAnalytics.learningProgress.currentTopic = topicId;
     setLearningProgress(learningAnalytics.getLearningProgress());
+  };
+
+  // Hilfsfunktion: Teilt Assistant-Content nach QA/AI-Abschnitten anhand der Pflicht-Labels
+  // Gibt Array aus Abschnitten mit type: 'qa' | 'ai' | 'unknown' und text (Markdown) zurück
+  const splitAssistantContent = (md = '') => {
+    // Unterstütze mehrere Varianten der Labels (mit/ohne **, mit/ohne [ ])
+    const core = 'GEPRÜFTE ANTWORT AUF QA-BASIS|UNSICHERE ANTWORT AUF KI-BASIS|UNSICHERE ERGÄNZUNG AUF KI-BASIS';
+    // 1) Prüfen, ob überhaupt Labels vorhanden sind
+    const detectRe = new RegExp(`(?:\\*\\*)?\\[?(?:${core})\\]?\\*\\*?`, 'i');
+    if (!detectRe.test(md)) return [];
+    // 2) Teile den Text an Labels (ohne Capturing-Groups, damit keine Labels in parts injiziert werden)
+    const splitRe = new RegExp(`(?:\\*\\*)?\\[?(?:${core})\\]?\\*\\*?`, 'g');
+    const parts = md.split(splitRe); // [pre, body1, body2, ...]
+    // 3) Extrahiere die reinen Label-Texte separat
+    const labelRe = new RegExp(`(?:\\*\\*)?\\[?(${core})\\]?\\*\\*?`, 'g');
+    const labelMatches = [...md.matchAll(labelRe)].map(m => m[1]);
+
+    const sections = [];
+    const pre = (parts[0] || '').trim();
+    if (pre) sections.push({ type: 'unknown', text: pre });
+    for (let i = 0; i < labelMatches.length; i++) {
+      const rawLabel = labelMatches[i] || '';
+      const body = (parts[i + 1] || '').trim(); // korrekt gepaart mit i-ter Marke
+      const isQA = rawLabel.toUpperCase().includes('GEPRÜFTE');
+      const type = isQA ? 'qa' : 'ai';
+      const text = `**[${rawLabel}]**\n\n${body}`.trim();
+      sections.push({ type, text });
+    }
+    return sections;
   };
 
   return (
@@ -461,6 +563,28 @@ function App() {
                 </select>
               </div>
 
+              {/* Anzeige-Modus: Alle vs. im Chat verwendete */}
+              <div style={{ opacity: wloSettings.enabled ? 1 : 0.5 }}>
+                <select
+                  value={wloSettings.sidebarMode}
+                  onChange={(e) => setWLOSettings({ ...wloSettings, sidebarMode: e.target.value })}
+                  disabled={!wloSettings.enabled}
+                  title="Anzeige der WLO-Seitenleiste"
+                  style={{
+                    width: '100%',
+                    padding: '6px 10px',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '6px',
+                    fontSize: '0.85rem',
+                    background: wloSettings.enabled ? 'white' : '#f9fafb',
+                    cursor: wloSettings.enabled ? 'pointer' : 'not-allowed'
+                  }}
+                >
+                  <option value="all">Alle Materialien anzeigen</option>
+                  <option value="used">Nur im Chat verwendete anzeigen</option>
+                </select>
+              </div>
+
               {/* Hinweis unter der linken Spalte */}
               <div style={{ gridColumn: '1 / 2', fontSize: '0.72rem', color: '#9ca3af' }}>
                 Leer lassen für alle Quellen
@@ -590,53 +714,76 @@ function App() {
               )}
               
               <div className="message-content">
-                <ReactMarkdown
-                  components={{
-                    a: ({ href, children, ...props }) => (
-                      <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
-                        {children}
-                      </a>
-                    )
-                  }}
-                >
-                  {message.content}
-                </ReactMarkdown>
+                {message.role === 'assistant' ? (() => {
+                  const sections = splitAssistantContent(message.content);
+                  if (sections.length === 0) {
+                    return (
+                      <ReactMarkdown
+                        components={{
+                          a: ({ href, children, ...props }) => (
+                            <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+                              {children}
+                            </a>
+                          )
+                        }}
+                      >
+                        {message.content}
+                      </ReactMarkdown>
+                    );
+                  }
+                  return (
+                    <div>
+                      {sections.map((sec, idx) => (
+                        <div key={idx} style={{
+                          background: sec.type === 'qa' ? '#f0fdf4' : 'transparent',
+                          border: sec.type === 'qa' ? '1px solid #bbf7d0' : 'none',
+                          borderRadius: 10,
+                          padding: sec.type === 'qa' ? '12px' : 0,
+                          marginBottom: idx < sections.length - 1 ? 10 : 0
+                        }}>
+                          <ReactMarkdown
+                            components={{
+                              a: ({ href, children, ...props }) => (
+                                <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+                                  {children}
+                                </a>
+                              )
+                            }}
+                          >
+                            {sec.text}
+                          </ReactMarkdown>
+                          {sec.type === 'qa' && message.sourceUrl && (
+                            <div style={{ marginTop: '8px' }}>
+                              <a
+                                href={message.sourceUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#166534', fontWeight: 600 }}
+                              >
+                                <ExternalLink size={14} />
+                                Zur Lernressource
+                              </a>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })() : (
+                  <ReactMarkdown
+                    components={{
+                      a: ({ href, children, ...props }) => (
+                        <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+                          {children}
+                        </a>
+                      )
+                    }}
+                  >
+                    {message.content}
+                  </ReactMarkdown>
+                )}
               </div>
-              
-              {message.sourceUrl && (
-                <div className="source-link">
-                  <a href={message.sourceUrl} target="_blank" rel="noopener noreferrer">
-                    <ExternalLink size={14} />
-                    Zur Lernressource
-                  </a>
-                </div>
-              )}
-              
-              
-              {message.qaMatch && (
-                <div style={{ 
-                  fontSize: '0.8rem', 
-                  color: '#6b7280', 
-                  marginTop: '8px',
-                  fontStyle: 'italic'
-                }}>
-                  Ähnlichkeit: {(message.qaMatch.similarity * 100).toFixed(1)}% 
-                  {message.qaMatch.category && ` • Fach: ${message.qaMatch.category}`}
-                  {message.qaMatch.level && ` • Bildungsstufe: ${message.qaMatch.level}`}
-                  {message.qaMatch.difficulty && ` • Schwierigkeitsgrad: ${message.qaMatch.difficulty}`}
-                </div>
-              )}
-              
-              {message.provider && message.model && (
-                <div style={{ 
-                  fontSize: '0.75rem', 
-                  color: '#9ca3af', 
-                  marginTop: '2px',
-                  fontStyle: 'italic'
-                }}>
-                  {message.provider} • {message.model}
-                </div>
-              )}
+
             </div>
           </div>
         ))}
@@ -697,7 +844,11 @@ function App() {
       />
       
       <WLOSidebar 
-        suggestions={currentWLOSuggestions}
+        suggestions={
+          wloSettings.sidebarMode === 'used'
+            ? usedWLOSuggestions
+            : currentWLOSuggestions
+        }
         isLoading={isLoading && wloSettings.enabled}
         className="wlo-sidebar-container"
       />
